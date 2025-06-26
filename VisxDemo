@@ -1,0 +1,1298 @@
+import React, { useState, useMemo, useRef, useCallback } from 'react';
+import { 
+  Row, 
+  Col, 
+  Card, 
+  Typography, 
+  Space, 
+  Tag,
+  Switch,
+  theme,
+  ConfigProvider 
+} from 'antd';
+import { 
+  ThunderboltOutlined, 
+  BarChartOutlined,
+  HeatMapOutlined,
+  LineChartOutlined
+} from '@ant-design/icons';
+
+// VISX imports
+import { extent, max, min } from '@visx/vendor/d3-array';
+import * as allCurves from '@visx/curve';
+import { Group } from '@visx/group';
+import { LinePath, AreaClosed, Bar } from '@visx/shape';
+import { scaleTime, scaleLinear } from '@visx/scale';
+import { MarkerArrow, MarkerCircle } from '@visx/marker';
+import { LinearGradient } from '@visx/gradient';
+import { withTooltip, Tooltip } from '@visx/tooltip';
+import { localPoint } from '@visx/event';
+import { HeatmapCircle, HeatmapRect } from '@visx/heatmap';
+import { AreaStack } from '@visx/shape';
+
+import { Brush } from '@visx/brush';
+import { AxisBottom, AxisLeft } from '@visx/axis';
+import { GridRows, GridColumns } from '@visx/grid';
+import { SplitLinePath } from '@visx/shape';
+
+const { Title, Text } = Typography;
+
+// Generar datos de sensores más complejos para la demo
+const generateAdvancedSensorData = () => {
+  const sensors = [
+    { id: 'temp', name: 'Temperatura', unit: '°C', color: '#ff6b6b', baseValue: 22 },
+    { id: 'humidity', name: 'Humedad', unit: '%', color: '#4ecdc4', baseValue: 65 },
+    { id: 'light', name: 'Radiación PAR', unit: 'µmol', color: '#ffe66d', baseValue: 800 },
+    { id: 'pressure', name: 'Presión', unit: 'hPa', color: '#a8e6cf', baseValue: 1013 },
+    { id: 'co2', name: 'CO₂', unit: 'ppm', color: '#ff8b94', baseValue: 400 },
+    { id: 'soil', name: 'Humedad Suelo', unit: 'VWC', color: '#ffd93d', baseValue: 45 }
+  ];
+
+  const data = [];
+  const now = new Date();
+  const pointsPerSensor = 200;
+
+  sensors.forEach(sensor => {
+    for (let i = 0; i < pointsPerSensor; i++) {
+      const date = new Date(now.getTime() - (pointsPerSensor - i) * 60 * 60 * 1000);
+      const hour = date.getHours();
+      
+      let value = sensor.baseValue;
+      
+      // Patrones realistas por tipo de sensor
+      if (sensor.id === 'temp') {
+        const dailyCycle = Math.sin((hour / 24) * 2 * Math.PI - Math.PI/2) * 8;
+        const noise = (Math.random() - 0.5) * 3;
+        value = sensor.baseValue + dailyCycle + noise;
+      } else if (sensor.id === 'humidity') {
+        const dailyCycle = Math.sin((hour / 24) * 2 * Math.PI + Math.PI/2) * 15;
+        const noise = (Math.random() - 0.5) * 8;
+        value = Math.max(30, Math.min(90, sensor.baseValue + dailyCycle + noise));
+      } else if (sensor.id === 'light') {
+        if (hour >= 6 && hour <= 18) {
+          const solarCurve = Math.sin(((hour - 6) / 12) * Math.PI);
+          const clouds = Math.random() < 0.3 ? Math.random() * 0.4 : 0.1;
+          value = sensor.baseValue * solarCurve * (1 - clouds);
+        } else {
+          value = Math.random() * 50;
+        }
+      } else {
+        const trend = Math.sin((i / pointsPerSensor) * 2 * Math.PI) * (sensor.baseValue * 0.1);
+        const noise = (Math.random() - 0.5) * (sensor.baseValue * 0.05);
+        value = sensor.baseValue + trend + noise;
+      }
+
+      data.push({
+        id: `${sensor.id}_${i}`,
+        sensorId: sensor.id,
+        sensorName: sensor.name,
+        value: Math.round(value * 100) / 100,
+        date,
+        hour,
+        day: Math.floor(i / 24),
+        color: sensor.color,
+        unit: sensor.unit,
+        x: Math.random() * 2 + 0.5, // Para scatter plot
+        y: Math.random() * 1.5 + 0.5
+      });
+    }
+  });
+
+  return data;
+};
+
+// Generar datos para heatmap (temperatura por zona y hora)
+const generateHeatmapData = () => {
+  const zones = 8; // 8 zonas del invernadero
+  const hours = 24;
+  const data = [];
+
+  for (let zone = 0; zone < zones; zone++) {
+    const zoneData = [];
+    for (let hour = 0; hour < hours; hour++) {
+      const baseTemp = 20;
+      const dailyCycle = Math.sin((hour / 24) * 2 * Math.PI - Math.PI/2) * 6;
+      const zoneVariation = (zone % 2) * 2; // Algunas zonas más calientes
+      const noise = (Math.random() - 0.5) * 2;
+      
+      const temperature = baseTemp + dailyCycle + zoneVariation + noise;
+      
+      zoneData.push({
+        hour,
+        zone,
+        temperature: Math.round(temperature * 10) / 10,
+        count: Math.round(temperature) // Para el heatmap
+      });
+    }
+    data.push({ zone, data: zoneData });
+  }
+
+  return data;
+};
+
+// Componente Curves Demo simplificado
+const CurvesDemo = withTooltip(({ width, height, data, showTooltip, hideTooltip, tooltipOpen, tooltipData, tooltipLeft, tooltipTop }) => {
+  const [selectedSensors, setSelectedSensors] = useState(['temp', 'humidity', 'light']);
+  const svgRef = useRef(null);
+
+  // Ajustar dimensiones para aprovechar mejor el espacio
+  const margin = { top: 15, right: 15, bottom: 35, left: 45 };
+  const chartWidth = width - margin.left - margin.right;
+  const chartHeight = height - margin.top - margin.bottom - 50; // Espacio para el selector
+
+  const filteredData = useMemo(() => {
+    const grouped = {};
+    selectedSensors.forEach(sensorId => {
+      grouped[sensorId] = data.filter(d => d.sensorId === sensorId).slice(0, 50);
+    });
+    return grouped;
+  }, [data, selectedSensors]);
+
+  const allFilteredData = useMemo(() => 
+    Object.values(filteredData).flat(), [filteredData]
+  );
+
+  const xScale = scaleTime({
+    range: [0, chartWidth],
+    domain: extent(allFilteredData, d => d.date),
+  });
+
+  const yScale = scaleLinear({
+    range: [chartHeight, 0],
+    domain: extent(allFilteredData, d => d.value),
+    nice: true,
+  });
+
+  const colors = {
+    temp: '#ff4757',
+    humidity: '#2ed573', 
+    light: '#ffa502',
+    pressure: '#70a1ff',
+    co2: '#ff6b9d',
+    soil: '#f1c40f'
+  };
+
+  const handleMouseMove = useCallback((event) => {
+    if (!svgRef.current) return;
+    const point = localPoint(svgRef.current, event);
+    if (!point) return;
+
+    const x = xScale.invert(point.x - margin.left);
+    let closestPoint = null;
+    let minDistance = Infinity;
+
+    allFilteredData.forEach(d => {
+      const distance = Math.abs(d.date.getTime() - x.getTime());
+      if (distance < minDistance) {
+        minDistance = distance;
+        closestPoint = d;
+      }
+    });
+
+    if (closestPoint) {
+      showTooltip({
+        tooltipLeft: xScale(closestPoint.date) + margin.left,
+        tooltipTop: yScale(closestPoint.value) + margin.top,
+        tooltipData: closestPoint,
+      });
+    }
+  }, [xScale, yScale, showTooltip, allFilteredData, margin]);
+
+  const sensorNames = {
+    temp: 'Temperatura',
+    humidity: 'Humedad',
+    light: 'Radiación',
+    pressure: 'Presión',
+    co2: 'CO₂',
+    soil: 'Suelo'
+  };
+
+  return (
+    <div style={{ width: '100%', height: '100%' }}>
+      {/* Selector de sensores compacto */}
+      <div style={{ marginBottom: 12, paddingLeft: 8 }}>
+        <Space wrap size="small">
+          <Text style={{ color: '#ccc', fontSize: '11px' }}>Sensores:</Text>
+          {Object.keys(colors).map(key => (
+            <Tag
+              key={key}
+              color={selectedSensors.includes(key) ? colors[key] : 'default'}
+              style={{ 
+                cursor: 'pointer', 
+                fontSize: '10px',
+                padding: '2px 6px',
+                borderColor: colors[key],
+                backgroundColor: selectedSensors.includes(key) ? colors[key] + '20' : 'transparent'
+              }}
+              onClick={() => {
+                if (selectedSensors.includes(key)) {
+                  if (selectedSensors.length > 1) {
+                    setSelectedSensors(selectedSensors.filter(k => k !== key));
+                  }
+                } else {
+                  setSelectedSensors([...selectedSensors, key]);
+                }
+              }}
+            >
+              {sensorNames[key]}
+            </Tag>
+          ))}
+        </Space>
+      </div>
+
+      <svg width={width} height={height - 50} ref={svgRef}>
+        <LinearGradient id="curve-bg" from="#0f172a" to="#1e293b" />
+        <rect width={width} height={height - 50} fill="url(#curve-bg)" rx={8} />
+        
+        <MarkerCircle id="marker-circle-improved" fill="#64748b" size={3} refX={1.5} />
+
+        <Group left={margin.left} top={margin.top}>
+          <GridRows
+            scale={yScale}
+            width={chartWidth}
+            height={chartHeight}
+            stroke="rgba(255,255,255,0.06)"
+            strokeDasharray="2,3"
+            numTicks={4}
+          />
+          <GridColumns
+            scale={xScale}
+            width={chartWidth}
+            height={chartHeight}
+            stroke="rgba(255,255,255,0.06)"
+            strokeDasharray="2,3"
+            numTicks={5}
+          />
+
+          {Object.entries(filteredData).map(([sensorId, sensorData]) => (
+            <Group key={sensorId}>
+              {/* Área de fondo sutil */}
+              <AreaClosed
+                data={sensorData}
+                x={d => xScale(d.date)}
+                y={d => yScale(d.value)}
+                yScale={yScale}
+                fill={colors[sensorId]}
+                fillOpacity={0.12}
+                curve={allCurves.curveBasis}
+              />
+              
+              {/* Puntos de datos (siempre visibles) */}
+              {sensorData.map((d, j) => (
+                j % 4 === 0 && (
+                  <circle
+                    key={j}
+                    r={2.5}
+                    cx={xScale(d.date)}
+                    cy={yScale(d.value)}
+                    fill={colors[sensorId]}
+                    fillOpacity={0.8}
+                    stroke="rgba(255,255,255,0.4)"
+                    strokeWidth={1}
+                  />
+                )
+              ))}
+              
+              {/* Línea principal usando basis */}
+              <LinePath
+                data={sensorData}
+                x={d => xScale(d.date)}
+                y={d => yScale(d.value)}
+                stroke={colors[sensorId]}
+                strokeWidth={2.5}
+                curve={allCurves.curveBasis}
+                strokeOpacity={0.9}
+              />
+            </Group>
+          ))}
+
+          {/* Overlay invisible para tooltips */}
+          <rect
+            width={chartWidth}
+            height={chartHeight}
+            fill="transparent"
+            onMouseMove={handleMouseMove}
+            onMouseLeave={hideTooltip}
+          />
+
+          <AxisBottom
+            top={chartHeight}
+            scale={xScale}
+            numTicks={4}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'middle' }}
+            tickFormat={(d) => d.toLocaleDateString('es-ES', { month: 'short', day: 'numeric' })}
+          />
+          <AxisLeft
+            scale={yScale}
+            numTicks={4}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'end', dx: -4 }}
+            tickFormat={d => d.toFixed(1)}
+          />
+        </Group>
+      </svg>
+
+      {tooltipOpen && tooltipData && (
+        <Tooltip left={tooltipLeft + 10} top={tooltipTop + 10}>
+          <div style={{ 
+            background: '#1e293b', 
+            color: '#fff', 
+            padding: '8px 12px', 
+            borderRadius: '6px',
+            border: '1px solid #374151',
+            fontSize: '12px'
+          }}>
+            <div style={{ fontWeight: 'bold', color: colors[tooltipData.sensorId] }}>
+              {tooltipData.sensorName}
+            </div>
+            <div>Valor: {tooltipData.value} {tooltipData.unit}</div>
+            <div>Fecha: {tooltipData.date.toLocaleDateString('es-ES')}</div>
+            <div>Hora: {tooltipData.date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}</div>
+          </div>
+        </Tooltip>
+      )}
+    </div>
+  );
+});
+
+// Componente Heatmap optimizado
+const HeatmapDemo = withTooltip(({ width, height, showTooltip, hideTooltip, tooltipOpen, tooltipData, tooltipLeft, tooltipTop }) => {
+  const data = useMemo(() => generateHeatmapData(), []);
+  const [showCircles, setShowCircles] = useState(true);
+  const svgRef = useRef(null);
+
+  // Ajustar dimensiones para aprovechar mejor el espacio
+  const margin = { top: 15, right: 15, bottom: 50, left: 60 };
+  const legendWidth = 70;
+  const chartWidth = width - margin.left - margin.right - legendWidth;
+  const chartHeight = height - margin.top - margin.bottom - 50; // Espacio para controles
+
+  const maxTemp = max(data.flatMap(d => d.data), d => d.temperature);
+  const minTemp = min(data.flatMap(d => d.data), d => d.temperature);
+
+  const xScale = scaleLinear({
+    range: [0, chartWidth],
+    domain: [0, 23],
+  });
+
+  const yScale = scaleLinear({
+    range: [0, chartHeight],
+    domain: [0, 7],
+  });
+
+  const colorScale = scaleLinear({
+    domain: [minTemp, (minTemp + maxTemp) / 2, maxTemp],
+    range: ['#1e3a8a', '#f59e0b', '#dc2626'],
+  });
+
+  const cellWidth = chartWidth / 24;
+  const cellHeight = chartHeight / 8;
+
+  const handleMouseMove = useCallback((event) => {
+    if (!svgRef.current) return;
+    const point = localPoint(svgRef.current, event);
+    if (!point) return;
+
+    const adjustedX = point.x - margin.left;
+    const adjustedY = point.y - margin.top;
+    
+    if (adjustedX < 0 || adjustedY < 0) return;
+
+    const hour = Math.floor(xScale.invert(adjustedX));
+    const zone = Math.floor(yScale.invert(adjustedY));
+
+    if (hour >= 0 && hour < 24 && zone >= 0 && zone < 8) {
+      const cellData = data[zone]?.data[hour];
+      if (cellData) {
+        showTooltip({
+          tooltipLeft: point.x,
+          tooltipTop: point.y,
+          tooltipData: cellData,
+        });
+      }
+    }
+  }, [xScale, yScale, showTooltip, data, margin]);
+
+  return (
+    <div style={{ width: '100%', height: '100%' }}>
+      <div style={{ marginBottom: 8, paddingLeft: 6 }}>
+        <Space size="small" style={{ flexWrap: 'wrap' }}>
+          <Switch 
+            checked={showCircles} 
+            onChange={setShowCircles}
+            checkedChildren="●"
+            unCheckedChildren="■"
+            size="small"
+          />
+          <Text style={{ color: '#ccc', fontSize: '10px' }}>
+            🌡️ Temperatura por zona/hora
+          </Text>
+          <Text style={{ color: '#64748b', fontSize: '9px' }}>
+            {minTemp.toFixed(1)}°C - {maxTemp.toFixed(1)}°C
+          </Text>
+        </Space>
+      </div>
+
+      <svg width={width} height={height - 50} ref={svgRef}>
+        <LinearGradient id="heatmap-bg-improved" from="#0f172a" to="#1e293b" />
+        <rect width={width} height={height - 50} fill="url(#heatmap-bg-improved)" rx={8} />
+
+        <Group left={margin.left} top={margin.top}>
+          {data.map((zoneData, zoneIndex) =>
+            zoneData.data.map((cell, hourIndex) => {
+              const x = xScale(hourIndex);
+              const y = yScale(zoneIndex);
+              const color = colorScale(cell.temperature);
+              const intensity = (cell.temperature - minTemp) / (maxTemp - minTemp);
+
+              if (showCircles) {
+                return (
+                  <circle
+                    key={`${zoneIndex}-${hourIndex}`}
+                    cx={x + cellWidth / 2}
+                    cy={y + cellHeight / 2}
+                    r={Math.min(cellWidth, cellHeight) / 2.8}
+                    fill={color}
+                    opacity={0.8 + intensity * 0.2}
+                    stroke="rgba(255,255,255,0.2)"
+                    strokeWidth={0.5}
+                  />
+                );
+              } else {
+                return (
+                  <rect
+                    key={`${zoneIndex}-${hourIndex}`}
+                    x={x + 1}
+                    y={y + 1}
+                    width={cellWidth - 2}
+                    height={cellHeight - 2}
+                    fill={color}
+                    opacity={0.8 + intensity * 0.2}
+                    stroke="rgba(255,255,255,0.15)"
+                    strokeWidth={0.5}
+                    rx={2}
+                  />
+                );
+              }
+            })
+          )}
+
+          {/* Overlay para tooltips */}
+          <rect
+            width={chartWidth}
+            height={chartHeight}
+            fill="transparent"
+            onMouseMove={handleMouseMove}
+            onMouseLeave={hideTooltip}
+          />
+
+          <AxisBottom
+            top={chartHeight}
+            scale={xScale}
+            numTicks={4}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 8, textAnchor: 'middle' }}
+            tickFormat={d => `${Math.floor(d)}h`}
+          />
+          <AxisLeft
+            scale={yScale}
+            numTicks={8}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'end', dx: -4 }}
+            tickFormat={d => `Zona ${Math.floor(d) + 1}`}
+          />
+        </Group>
+
+        {/* Leyenda de temperatura compacta */}
+        <Group left={margin.left + chartWidth + 10} top={margin.top + 10}>
+          <rect x={-5} y={-5} width={65} height={chartHeight * 0.8} fill="rgba(0,0,0,0.7)" rx={4} stroke="rgba(255,255,255,0.1)" />
+          <text x={27} y={8} fill="#94a3b8" fontSize={10} textAnchor="middle" fontWeight="bold">Temp °C</text>
+          
+          {/* Gradiente continuo */}
+          <defs>
+            <linearGradient id="temp-legend-gradient" x1="0%" y1="100%" x2="0%" y2="0%">
+              <stop offset="0%" stopColor="#1e3a8a" />
+              <stop offset="50%" stopColor="#f59e0b" />
+              <stop offset="100%" stopColor="#dc2626" />
+            </linearGradient>
+          </defs>
+          
+          <rect
+            x={5}
+            y={18}
+            width={12}
+            height={chartHeight * 0.5}
+            fill="url(#temp-legend-gradient)"
+            stroke="rgba(255,255,255,0.3)"
+            strokeWidth={1}
+            rx={2}
+          />
+          
+          {/* Etiquetas de valores */}
+          <text x={22} y={25} fill="#94a3b8" fontSize={7} textAnchor="start">{maxTemp.toFixed(1)}°</text>
+          <text x={22} y={18 + chartHeight * 0.25} fill="#94a3b8" fontSize={7} textAnchor="start">{((minTemp + maxTemp) / 2).toFixed(1)}°</text>
+          <text x={22} y={18 + chartHeight * 0.48} fill="#94a3b8" fontSize={7} textAnchor="start">{minTemp.toFixed(1)}°</text>
+          
+          {/* Indicadores de estado compactos */}
+          <text x={2} y={18 + chartHeight * 0.6} fill="#dc2626" fontSize={6}>Alto</text>
+          <text x={2} y={18 + chartHeight * 0.68} fill="#f59e0b" fontSize={6}>Med</text>
+          <text x={2} y={18 + chartHeight * 0.76} fill="#1e3a8a" fontSize={6}>Bajo</text>
+        </Group>
+      </svg>
+
+      {tooltipOpen && tooltipData && (
+        <Tooltip left={tooltipLeft + 10} top={tooltipTop + 10}>
+          <div style={{ 
+            background: '#1e293b', 
+            color: '#fff', 
+            padding: '8px 12px', 
+            borderRadius: '6px',
+            border: '1px solid #374151',
+            fontSize: '12px'
+          }}>
+            <div style={{ fontWeight: 'bold', color: '#f59e0b' }}>
+              Zona {tooltipData.zone + 1} - {tooltipData.hour}:00h
+            </div>
+            <div>Temperatura: {tooltipData.temperature}°C</div>
+            <div style={{ color: tooltipData.temperature > 24 ? '#dc2626' : 
+                               tooltipData.temperature > 20 ? '#f59e0b' : '#1e3a8a' }}>
+              Estado: {tooltipData.temperature > 24 ? 'Alto' : 
+                       tooltipData.temperature > 20 ? 'Normal' : 'Bajo'}
+            </div>
+          </div>
+        </Tooltip>
+      )}
+    </div>
+  );
+});
+
+
+
+// Componente Stacked Areas optimizado
+const StackedAreasDemo = withTooltip(({ width, height, data, showTooltip, hideTooltip, tooltipOpen, tooltipData, tooltipLeft, tooltipTop }) => {
+  const [selectedKeys, setSelectedKeys] = useState(['temp', 'humidity', 'light']);
+  const svgRef = useRef(null);
+
+  // Ajustar dimensiones para aprovechar mejor el espacio
+  const margin = { top: 15, right: 15, bottom: 35, left: 40 };
+  const chartWidth = width - margin.left - margin.right;
+  const chartHeight = height - margin.top - margin.bottom - 70; // Espacio para controles
+
+  const processedData = useMemo(() => {
+    const grouped = {};
+    data.forEach(d => {
+      const hour = d.date.getHours();
+      if (!grouped[hour]) {
+        grouped[hour] = { hour, temp: 0, humidity: 0, light: 0, pressure: 0, co2: 0, soil: 0 };
+      }
+      grouped[hour][d.sensorId] = (grouped[hour][d.sensorId] || 0) + d.value;
+    });
+
+    // Normalizar los datos para mejor visualización
+    return Object.values(grouped).sort((a, b) => a.hour - b.hour).map(d => ({
+      ...d,
+      temp: d.temp / 10,
+      humidity: d.humidity / 100,
+      light: d.light / 1000,
+      pressure: d.pressure / 100,
+      co2: d.co2 / 100,
+      soil: d.soil / 10
+    }));
+  }, [data]);
+
+  const colors = {
+    temp: '#ef4444',
+    humidity: '#06b6d4', 
+    light: '#f59e0b',
+    pressure: '#8b5cf6',
+    co2: '#ec4899',
+    soil: '#84cc16'
+  };
+
+  const xScale = scaleLinear({
+    range: [0, chartWidth],
+    domain: [0, 23],
+  });
+
+  const yScale = scaleLinear({
+    range: [chartHeight, 0],
+    domain: [0, max(processedData, d => selectedKeys.reduce((sum, key) => sum + d[key], 0)) * 1.1],
+    nice: true,
+  });
+
+  const handleMouseMove = useCallback((event) => {
+    if (!svgRef.current) return;
+    const point = localPoint(svgRef.current, event);
+    if (!point) return;
+
+    const hour = Math.round(xScale.invert(point.x - margin.left));
+    const hourData = processedData.find(d => d.hour === hour);
+    
+    if (hourData) {
+      showTooltip({
+        tooltipLeft: xScale(hour) + margin.left,
+        tooltipTop: point.y,
+        tooltipData: { ...hourData, hour },
+      });
+    }
+  }, [xScale, showTooltip, processedData, margin]);
+
+  const sensorNames = {
+    temp: 'Temperatura',
+    humidity: 'Humedad',
+    light: 'Radiación',
+    pressure: 'Presión',
+    co2: 'CO₂',
+    soil: 'Suelo'
+  };
+
+  return (
+    <div style={{ width: '100%', height: '100%' }}>
+      <div style={{ marginBottom: 12, paddingLeft: 8 }}>
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Text style={{ color: '#ccc', fontSize: '11px' }}>
+            📊 Distribución normalizada de sensores por hora del día
+          </Text>
+          <Space wrap size="small">
+            {Object.keys(colors).map(key => (
+              <Tag
+                key={key}
+                color={selectedKeys.includes(key) ? colors[key] : 'default'}
+                style={{ 
+                  cursor: 'pointer',
+                  fontSize: '10px',
+                  padding: '2px 6px',
+                  borderColor: colors[key],
+                  backgroundColor: selectedKeys.includes(key) ? colors[key] + '20' : 'transparent'
+                }}
+                onClick={() => {
+                  if (selectedKeys.includes(key)) {
+                    if (selectedKeys.length > 1) {
+                      setSelectedKeys(selectedKeys.filter(k => k !== key));
+                    }
+                  } else {
+                    setSelectedKeys([...selectedKeys, key]);
+                  }
+                }}
+              >
+                {sensorNames[key]}
+              </Tag>
+            ))}
+          </Space>
+        </Space>
+      </div>
+
+      <svg width={width} height={height - 70} ref={svgRef}>
+        <LinearGradient id="stacked-bg-improved" from="#0f172a" to="#1e293b" />
+        <rect width={width} height={height - 70} fill="url(#stacked-bg-improved)" rx={8} />
+
+        <Group left={margin.left} top={margin.top}>
+          <GridRows
+            scale={yScale}
+            width={chartWidth}
+            height={chartHeight}
+            stroke="rgba(255,255,255,0.05)"
+            strokeDasharray="2,3"
+            numTicks={4}
+          />
+
+          <AreaStack
+            data={processedData}
+            keys={selectedKeys}
+            x={d => xScale(d.data.hour)}
+            y0={d => yScale(d[0])}
+            y1={d => yScale(d[1])}
+          >
+            {({ stacks, path }) =>
+              stacks.map((stack) => (
+                <path
+                  key={stack.key}
+                  d={path(stack) || ''}
+                  stroke="rgba(255,255,255,0.1)"
+                  strokeWidth={1}
+                  fill={colors[stack.key]}
+                  fillOpacity={0.8}
+                />
+              ))
+            }
+          </AreaStack>
+
+          {/* Overlay para tooltips */}
+          <rect
+            width={chartWidth}
+            height={chartHeight}
+            fill="transparent"
+            onMouseMove={handleMouseMove}
+            onMouseLeave={hideTooltip}
+          />
+
+          <AxisBottom
+            top={chartHeight}
+            scale={xScale}
+            numTicks={6}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'middle' }}
+            tickFormat={d => `${d}:00`}
+          />
+          <AxisLeft
+            scale={yScale}
+            numTicks={4}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'end', dx: -4 }}
+            tickFormat={d => d.toFixed(1)}
+          />
+        </Group>
+      </svg>
+
+      {tooltipOpen && tooltipData && (
+        <Tooltip left={tooltipLeft + 10} top={tooltipTop + 10}>
+          <div style={{ 
+            background: '#1e293b', 
+            color: '#fff', 
+            padding: '8px 12px', 
+            borderRadius: '6px',
+            border: '1px solid #374151',
+            fontSize: '12px'
+          }}>
+            <div style={{ fontWeight: 'bold', color: '#f59e0b', marginBottom: '4px' }}>
+              {tooltipData.hour}:00 hrs
+            </div>
+            {selectedKeys.map(key => (
+              <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
+                <span style={{ color: colors[key] }}>
+                  {sensorNames[key]}:
+                </span>
+                <span>{tooltipData[key].toFixed(2)}</span>
+              </div>
+            ))}
+          </div>
+        </Tooltip>
+      )}
+    </div>
+  );
+});
+
+// Componente Split Line Paths optimizado - Para cambios críticos de temperatura
+const SplitLinePathDemo = ({ width, height, data }) => {
+  const [showCriticalChanges, setShowCriticalChanges] = useState(true);
+  
+  // Ajustar dimensiones para aprovechar mejor el espacio
+  const margin = { top: 15, right: 20, bottom: 35, left: 45 };
+  const infoWidth = 140;
+  const chartWidth = width - margin.left - margin.right - infoWidth;
+  const chartHeight = height - margin.top - margin.bottom - 60; // Espacio para controles
+  
+  const tempData = useMemo(() => {
+    const filtered = data.filter(d => d.sensorId === 'temp').slice(0, 80);
+    const segments = [];
+    let currentSegment = [];
+    let criticalPoints = [];
+    
+    for (let i = 0; i < filtered.length; i++) {
+      const point = { 
+        x: i * 5, 
+        y: filtered[i].value * 12,
+        originalValue: filtered[i].value,
+        date: filtered[i].date,
+        isCritical: false
+      };
+      
+      // Detectar cambios críticos (>2.5°C)
+      if (i > 0) {
+        const tempChange = Math.abs(filtered[i].value - filtered[i-1].value);
+        if (tempChange > 2.5) {
+          point.isCritical = true;
+          criticalPoints.push(point);
+          
+          // Finalizar segmento actual y comenzar uno nuevo
+          if (currentSegment.length > 0) {
+            currentSegment.push(point);
+            segments.push({ points: [...currentSegment], type: 'normal' });
+            currentSegment = [point];
+          }
+        }
+      }
+      
+      currentSegment.push(point);
+      
+      // Crear segmentos cada 15 puntos para mejor performance
+      if (currentSegment.length >= 15 && !point.isCritical) {
+        segments.push({ points: [...currentSegment], type: 'normal' });
+        currentSegment = [currentSegment[currentSegment.length - 1]]; // Mantener continuidad
+      }
+    }
+    
+    if (currentSegment.length > 0) {
+      segments.push({ points: currentSegment, type: 'normal' });
+    }
+    
+    return { segments, criticalPoints };
+  }, [data]);
+
+  const xScale = scaleLinear({
+    range: [0, chartWidth],
+    domain: [0, 400],
+  });
+
+  const yScale = scaleLinear({
+    range: [chartHeight, 0],
+    domain: [150, 420],
+    nice: true,
+  });
+
+  const getX = (d) => d.x;
+  const getY = (d) => d.y;
+
+  return (
+    <div style={{ width: '100%', height: '100%' }}>
+      <div style={{ marginBottom: 12, paddingLeft: 8 }}>
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Text style={{ color: '#ccc', fontSize: '11px' }}>
+            🔥 Detección automática de cambios críticos de temperatura (&gt;2.5°C)
+          </Text>
+          <Space>
+            <Switch 
+              checked={showCriticalChanges} 
+              onChange={setShowCriticalChanges}
+              checkedChildren="Análisis Crítico"
+              unCheckedChildren="Vista Simple"
+              size="small"
+            />
+            <Text style={{ color: '#64748b', fontSize: '10px' }}>
+              {tempData.criticalPoints.length} cambios críticos detectados
+            </Text>
+          </Space>
+        </Space>
+      </div>
+
+      <svg width={width} height={height - 60}>
+        <LinearGradient id="split-bg-improved" from="#0f172a" to="#1e293b" />
+        <rect width={width} height={height - 60} fill="url(#split-bg-improved)" rx={8} />
+
+        <Group left={margin.left} top={margin.top}>
+          <GridRows
+            scale={yScale}
+            width={chartWidth}
+            height={chartHeight}
+            stroke="rgba(255,255,255,0.05)"
+            strokeDasharray="2,3"
+            numTicks={4}
+          />
+
+          {showCriticalChanges ? (
+            <g>
+              {/* Renderizar segmentos normales */}
+              {tempData.segments.map((segment, index) => (
+                <LinePath
+                  key={index}
+                  data={segment.points}
+                  x={d => xScale(getX(d))}
+                  y={d => yScale(getY(d))}
+                  stroke="#06b6d4"
+                  strokeWidth={2.5}
+                  strokeOpacity={0.8}
+                />
+              ))}
+              
+              {/* Resaltar puntos críticos */}
+              {tempData.criticalPoints.map((point, i) => (
+                <g key={i}>
+                  <circle
+                    cx={xScale(getX(point))}
+                    cy={yScale(getY(point))}
+                    r={8}
+                    fill="#dc2626"
+                    fillOpacity={0.2}
+                  />
+                  <circle
+                    cx={xScale(getX(point))}
+                    cy={yScale(getY(point))}
+                    r={4}
+                    fill="#dc2626"
+                    stroke="#fca5a5"
+                    strokeWidth={2}
+                  />
+                  {/* Línea de alerta vertical */}
+                  <line
+                    x1={xScale(getX(point))}
+                    y1={yScale(getY(point)) - 20}
+                    x2={xScale(getX(point))}
+                    y2={yScale(getY(point)) + 20}
+                    stroke="#dc2626"
+                    strokeWidth={1}
+                    strokeDasharray="3,2"
+                    opacity={0.6}
+                  />
+                </g>
+              ))}
+            </g>
+          ) : (
+            <LinePath
+              data={tempData.segments.flatMap(s => s.points)}
+              x={d => xScale(getX(d))}
+              y={d => yScale(getY(d))}
+              stroke="#06b6d4"
+              strokeWidth={2}
+              strokeOpacity={0.9}
+            />
+          )}
+
+          <AxisBottom
+            top={chartHeight}
+            scale={xScale}
+            numTicks={6}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'middle' }}
+            tickFormat={d => `${Math.floor(d/20)}h`}
+          />
+          <AxisLeft
+            scale={yScale}
+            numTicks={4}
+            stroke="#64748b"
+            tickStroke="#64748b"
+            tickLabelProps={{ fill: '#94a3b8', fontSize: 9, textAnchor: 'end', dx: -4 }}
+            tickFormat={d => `${(d/12).toFixed(1)}°C`}
+          />
+        </Group>
+
+        {/* Panel de información optimizado */}
+        <Group left={margin.left + chartWidth + 10} top={margin.top + 10}>
+          <rect x={0} y={0} width={130} height={100} fill="rgba(0,0,0,0.8)" rx={6} stroke="rgba(255,255,255,0.1)" />
+          <text x={8} y={16} fill="#f59e0b" fontSize={10} fontWeight="bold">🚨 Monitor Térmico</text>
+          
+          {/* Estado actual */}
+          <circle cx={15} cy={32} r={3} fill="#06b6d4" />
+          <text x={22} y={36} fill="#94a3b8" fontSize={8}>Normal (±2.5°C)</text>
+          
+          <circle cx={15} cy={50} r={3} fill="#dc2626" />
+          <text x={22} y={54} fill="#94a3b8" fontSize={8}>Crítico (&gt;2.5°C)</text>
+          
+          <circle cx={15} cy={68} r={3} fill="#f59e0b" />
+          <text x={22} y={72} fill="#94a3b8" fontSize={8}>En observación</text>
+          
+          {/* Estadísticas */}
+          <text x={8} y={90} fill="#64748b" fontSize={8}>
+            Total alertas: {tempData.criticalPoints.length}
+          </text>
+        </Group>
+      </svg>
+    </div>
+  );
+};
+
+
+
+// Componente Principal de la Demo
+const VisxDemo = () => {
+  const [data] = useState(() => generateAdvancedSensorData());
+
+  const totalSensors = [...new Set(data.map(d => d.sensorId))].length;
+  const totalDataPoints = data.length;
+  const timeRange = extent(data, d => d.date);
+  const avgTemperature = Math.round(
+    data.filter(d => d.sensorId === 'temp')
+      .reduce((sum, d) => sum + d.value, 0) / 
+    data.filter(d => d.sensorId === 'temp').length * 10
+  ) / 10;
+
+  return (
+    <ConfigProvider
+      theme={{
+        algorithm: theme.darkAlgorithm,
+        token: {
+          colorBgBase: '#0a0a0a',
+          colorBgContainer: '#1a1a1a',
+          colorBgLayout: '#000000',
+          colorBorder: '#333333',
+          colorText: '#ffffff',
+        },
+      }}
+    >
+      <div style={{ 
+        padding: '24px', 
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        minHeight: '100vh'
+      }}>
+        {/* Header Compacto Aprovechando Espacio Horizontal */}
+        <Card style={{ 
+          marginBottom: '16px', 
+          background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)',
+          border: '1px solid #333',
+          boxShadow: '0 4px 16px rgba(0, 0, 0, 0.3)'
+        }}>
+          <div style={{ padding: '16px 24px' }}>
+            {/* Fila 1: Título + KPIs Espaciados */}
+            <Row align="middle" justify="space-between" style={{ marginBottom: '12px' }}>
+              {/* Título */}
+              <Col>
+                <Space align="center" size="large">
+                  <ThunderboltOutlined style={{ fontSize: '24px', color: '#ff6b6b' }} />
+                  <div>
+                    <Title level={2} style={{ margin: 0, color: '#fff', fontSize: '22px', lineHeight: '24px' }}>
+                      Modular Cloud Demo
+                    </Title>
+                    <Text style={{ color: '#94a3b8', fontSize: '13px', lineHeight: '16px' }}>
+                      Plataforma avanzada de visualización de datos IoT
+                    </Text>
+                  </div>
+                </Space>
+              </Col>
+              
+              {/* KPIs espaciados horizontalmente */}
+              <Col>
+                <Row gutter={32} align="middle">
+                  <Col>
+                    <div style={{ textAlign: 'center', padding: '8px 16px', background: 'rgba(255,255,255,0.08)', borderRadius: '8px', minWidth: '90px' }}>
+                      <Text style={{ color: '#4ecdc4', fontSize: '20px', fontWeight: 'bold', display: 'block', lineHeight: '22px' }}>{totalSensors}</Text>
+                      <Text style={{ color: '#94a3b8', fontSize: '12px', lineHeight: '14px' }}>Sensores Activos</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ textAlign: 'center', padding: '8px 16px', background: 'rgba(255,255,255,0.08)', borderRadius: '8px', minWidth: '90px' }}>
+                      <Text style={{ color: '#ffe66d', fontSize: '20px', fontWeight: 'bold', display: 'block', lineHeight: '22px' }}>{(totalDataPoints/1000).toFixed(1)}K</Text>
+                      <Text style={{ color: '#94a3b8', fontSize: '12px', lineHeight: '14px' }}>Puntos de Datos</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ textAlign: 'center', padding: '8px 16px', background: 'rgba(255,255,255,0.08)', borderRadius: '8px', minWidth: '90px' }}>
+                      <Text style={{ color: '#ff6b6b', fontSize: '20px', fontWeight: 'bold', display: 'block', lineHeight: '22px' }}>{avgTemperature}°C</Text>
+                      <Text style={{ color: '#94a3b8', fontSize: '12px', lineHeight: '14px' }}>Temp. Promedio</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ textAlign: 'center', padding: '8px 16px', background: 'rgba(255,255,255,0.08)', borderRadius: '8px', minWidth: '90px' }}>
+                      <Text style={{ color: '#a8e6cf', fontSize: '20px', fontWeight: 'bold', display: 'block', lineHeight: '22px' }}>7 días</Text>
+                      <Text style={{ color: '#94a3b8', fontSize: '12px', lineHeight: '14px' }}>Rango Temporal</Text>
+                    </div>
+                  </Col>
+                </Row>
+              </Col>
+              
+
+            </Row>
+
+            {/* Fila 2: Leyenda distribuida horizontalmente */}
+            <Row justify="space-between" align="middle" style={{ padding: '8px 0', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+              <Col flex="auto">
+                <Row gutter={40} justify="start">
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#ff6b6b', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>Temperatura</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#4ecdc4', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>Humedad</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#ffe66d', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>Radiación PAR</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#a8e6cf', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>Presión</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#ff8b94', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>CO₂</Text>
+                    </div>
+                  </Col>
+                  <Col>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div style={{ width: '12px', height: '12px', backgroundColor: '#ffd93d', borderRadius: '50%' }}></div>
+                      <Text style={{ color: '#ccc', fontSize: '12px' }}>Suelo</Text>
+                    </div>
+                  </Col>
+                </Row>
+              </Col>
+              <Col>
+                <Space size="large">
+                  <Text style={{ color: '#64748b', fontSize: '11px' }}>
+                    🔴 Crítico | 🟡 Advertencia | 🟢 Normal
+                  </Text>
+                </Space>
+              </Col>
+            </Row>
+          </div>
+        </Card>
+
+        {/* Grid 2x2 con todos los dashboards */}
+        <Row gutter={[16, 16]}>
+          {/* Fila Superior */}
+          <Col xs={24} xl={12}>
+            <Card 
+              title={
+                <Space>
+                  <LineChartOutlined style={{ color: '#4ecdc4' }} />
+                  <span style={{ color: '#fff' }}>Curvas & Tendencias</span>
+                </Space>
+              }
+              style={{ 
+                background: '#1a1a2e', 
+                border: '1px solid #333',
+                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)',
+                height: '480px'
+              }}
+              headStyle={{ 
+                background: 'rgba(255,255,255,0.05)', 
+                borderBottom: '1px solid rgba(255,255,255,0.1)',
+                padding: '8px 16px'
+              }}
+              bodyStyle={{ 
+                padding: '8px',
+                height: 'calc(100% - 50px)',
+                overflow: 'hidden'
+              }}
+            >
+              <div style={{ width: '100%', height: '100%' }}>
+                <CurvesDemo width={window.innerWidth < 1600 ? 550 : 650} height={410} data={data} />
+              </div>
+            </Card>
+          </Col>
+
+          <Col xs={24} xl={12}>
+            <Card 
+              title={
+                <Space>
+                  <HeatMapOutlined style={{ color: '#ff6b6b' }} />
+                  <span style={{ color: '#fff' }}>Mapa de Calor</span>
+                </Space>
+              }
+              style={{ 
+                background: '#1a1a2e', 
+                border: '1px solid #333',
+                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)',
+                height: '480px'
+              }}
+              headStyle={{ 
+                background: 'rgba(255,255,255,0.05)', 
+                borderBottom: '1px solid rgba(255,255,255,0.1)',
+                padding: '8px 16px'
+              }}
+              bodyStyle={{ 
+                padding: '4px',
+                height: 'calc(100% - 50px)',
+                overflow: 'hidden'
+              }}
+            >
+              <div style={{ width: '100%', height: '100%' }}>
+                <HeatmapDemo width={window.innerWidth < 1600 ? 550 : 650} height={410} />
+              </div>
+            </Card>
+          </Col>
+
+          {/* Fila Inferior */}
+          <Col xs={24} xl={12}>
+            <Card 
+              title={
+                <Space>
+                  <BarChartOutlined style={{ color: '#ffe66d' }} />
+                  <span style={{ color: '#fff' }}>Áreas Apiladas</span>
+                </Space>
+              }
+              style={{ 
+                background: '#1a1a2e', 
+                border: '1px solid #333',
+                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)',
+                height: '480px'
+              }}
+              headStyle={{ 
+                background: 'rgba(255,255,255,0.05)', 
+                borderBottom: '1px solid rgba(255,255,255,0.1)',
+                padding: '8px 16px'
+              }}
+              bodyStyle={{ 
+                padding: '4px',
+                height: 'calc(100% - 50px)',
+                overflow: 'hidden'
+              }}
+            >
+              <div style={{ width: '100%', height: '100%' }}>
+                <StackedAreasDemo width={window.innerWidth < 1600 ? 550 : 650} height={410} data={data} />
+              </div>
+            </Card>
+          </Col>
+
+          <Col xs={24} xl={12}>
+            <Card 
+              title={
+                <Space>
+                  <ThunderboltOutlined style={{ color: '#a8e6cf' }} />
+                  <span style={{ color: '#fff' }}>Cambios Críticos</span>
+                </Space>
+              }
+              style={{ 
+                background: '#1a1a2e', 
+                border: '1px solid #333',
+                boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)',
+                height: '480px'
+              }}
+              headStyle={{ 
+                background: 'rgba(255,255,255,0.05)', 
+                borderBottom: '1px solid rgba(255,255,255,0.1)',
+                padding: '8px 16px'
+              }}
+              bodyStyle={{ 
+                padding: '4px',
+                height: 'calc(100% - 50px)',
+                overflow: 'hidden'
+              }}
+            >
+              <div style={{ width: '100%', height: '100%' }}>
+                <SplitLinePathDemo width={window.innerWidth < 1600 ? 550 : 650} height={410} data={data} />
+              </div>
+            </Card>
+          </Col>
+        </Row>
+
+        {/* Footer con información técnica */}
+        <Card style={{ 
+          marginTop: '24px', 
+          background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)',
+          border: '1px solid #333'
+        }}>
+          <Row justify="space-between" align="middle">
+            <Col>
+              <Space>
+                <Text style={{ color: '#ccc' }}>
+                  🚀 Powered by VISX + React + D3
+                </Text>
+                <Text style={{ color: '#ccc' }}>|</Text>
+                <Text style={{ color: '#ccc' }}>
+                  📊 {totalDataPoints.toLocaleString()} puntos procesados
+                </Text>
+                <Text style={{ color: '#ccc' }}>|</Text>
+                <Text style={{ color: '#ccc' }}>
+                  ⚡ Renderizado en tiempo real
+                </Text>
+              </Space>
+            </Col>
+            <Col>
+              <Text style={{ color: '#666', fontSize: '12px' }}>
+                Última actualización: {new Date().toLocaleString('es-ES')}
+              </Text>
+            </Col>
+          </Row>
+        </Card>
+      </div>
+    </ConfigProvider>
+  );
+};
+
+export default VisxDemo; 
